@@ -49,9 +49,10 @@ shell afterwards.
 `<mcu>` is an MCU name from the printer config or a board profile name, so
 `mcuflash klipper btt-octopus` works wherever exactly one MCU is that board.
 
-Options: `--dry-run` prints every command without running anything,
-`--yes` skips the build config menu and saves any changes,
-`--board <profile>` sets the board for an MCU, `--config-dir <dir>` reads another config.
+Options: `-n, --dry-run` prints every command without running anything,
+`-y, --yes` skips the build config menu and saves any changes,
+`-b, --board <profile>` sets the board for an MCU,
+`-c, --config-dir <dir>` reads another config.
 
 ### Which board is which MCU
 

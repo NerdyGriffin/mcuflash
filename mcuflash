@@ -728,13 +728,13 @@ def cmd_complete(args, mcus, boards):
 def main():
     global DRY_RUN, ASSUME_YES, CONFIG_DIR
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--config-dir", metavar="DIR", help=f"Klipper config directory (default {CONFIG_DIR})")
-    common.add_argument("--dry-run", action="store_true", help="print the commands without running them")
+    common.add_argument("-c", "--config-dir", metavar="DIR", help=f"Klipper config directory (default {CONFIG_DIR})")
+    common.add_argument("-n", "--dry-run", action="store_true", help="print the commands without running them")
     target = argparse.ArgumentParser(add_help=False)
     target.add_argument("targets", nargs="+", metavar="mcu", help="MCU name from the printer config, a board profile, or 'all'")
-    target.add_argument("--board", metavar="PROFILE", help="use (and remember) this board profile for the MCU")
+    target.add_argument("-b", "--board", metavar="PROFILE", help="use (and remember) this board profile for the MCU")
     flash = argparse.ArgumentParser(add_help=False)
-    flash.add_argument("--yes", action="store_true", help="skip the build config menu; keep and save any changes")
+    flash.add_argument("-y", "--yes", action="store_true", help="skip the build config menu; keep and save any changes")
 
     parser = argparse.ArgumentParser(prog="mcuflash", description=__doc__.split("\n\n")[0])
     sub = parser.add_subparsers(dest="command", required=True, metavar="command")
@@ -748,7 +748,7 @@ def main():
                           help="update an existing Katapult in place with deployer.bin instead of DFU/BOOTSEL")
     katapult.set_defaults(func=cmd_katapult)
     config = sub.add_parser("config", parents=[common, target], help="review a saved build config in menuconfig")
-    config.add_argument("--katapult", action="store_true", help="review the Katapult config instead of Klipper's")
+    config.add_argument("-k", "--katapult", action="store_true", help="review the Katapult config instead of Klipper's")
     config.set_defaults(func=cmd_config)
     sub.add_parser("complete-targets", parents=[common]).set_defaults(func=cmd_complete)
 

@@ -14,9 +14,9 @@ _mcuflash() {
                 [[ ${COMP_WORDS[1]} == katapult ]] && flags+=" --deployer"
                 [[ ${COMP_WORDS[1]} == config ]] && flags+=" --katapult"
                 COMPREPLY=($(compgen -W "$flags" -- "$cur"))
-            elif [[ ${COMP_WORDS[COMP_CWORD-1]} == --board ]]; then
+            elif [[ ${COMP_WORDS[COMP_CWORD-1]} == @(--board|-b) ]]; then
                 COMPREPLY=($(compgen -W "$("${COMP_WORDS[0]}" boards 2>/dev/null | awk 'NR>1 {print $1}')" -- "$cur"))
-            elif [[ ${COMP_WORDS[COMP_CWORD-1]} == --config-dir ]]; then
+            elif [[ ${COMP_WORDS[COMP_CWORD-1]} == @(--config-dir|-c) ]]; then
                 COMPREPLY=($(compgen -d -- "$cur"))
             else
                 COMPREPLY=($(compgen -W "$("${COMP_WORDS[0]}" complete-targets 2>/dev/null)" -- "$cur"))
