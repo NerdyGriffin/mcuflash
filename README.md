@@ -50,7 +50,7 @@ shell afterwards.
 `mcuflash klipper btt-octopus` works wherever exactly one MCU is that board.
 
 Options: `--dry-run` prints every command without running anything,
-`--no-menuconfig` skips the review, `--yes` saves build config changes without asking,
+`--yes` skips the build config menu and saves any changes,
 `--board <profile>` sets the board for an MCU, `--config-dir <dir>` reads another config.
 
 ### Which board is which MCU
@@ -64,10 +64,13 @@ board's serial ID.
 
 Each build starts from `boards/<board>/klipper.config`:
 
-1. Options added or removed by the installed Klipper version are applied and shown.
-2. `menuconfig` opens so you can check the config before it is used.
-3. If the result differs from the saved file you choose to keep and save it, discard the
-   changes, edit by hand in `vimdiff`, or quit.
+1. Options added or removed by the installed Klipper version are applied.
+2. A menu shows the difference from the saved file, if any, and lets you keep and save
+   it, discard it, open `menuconfig`, edit by hand in `vimdiff`, or quit.
+3. After `menuconfig` or `vimdiff` closes, the difference is checked and shown again, so
+   you can go round as often as you need before building.
+
+When nothing differs the menu is a one-key confirmation, with `menuconfig` still on offer.
 
 Saved changes land in `boards/`; commit them. If two hosts run different Klipper
 versions, each will want to update the shared config to its own version, so upgrade them

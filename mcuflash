@@ -85,7 +85,7 @@ def ask(prompt, choices, default=None):
         try:
             answer = input(prompt).strip().lower()
         except EOFError:
-            raise Fatal("no terminal to answer the prompt; use --yes or --no-menuconfig")
+            raise Fatal("no terminal to answer the prompt; use --yes")
         if not answer and default:
             return default
         if answer[:1] in choices:
@@ -372,7 +372,16 @@ def show_diff(old_path, new_path, old_label, new_label):
     return bool(lines)
 
 
-def review_config(board, firmware, source_dir, menuconfig=True):
+def run_menuconfig(source_dir, work):
+    """Open menuconfig on the work file; return False when there is no terminal for it."""
+    if not sys.stdin.isatty():
+        warn("menuconfig needs a terminal")
+        return False
+    subprocess.run(["make", "menuconfig", f"KCONFIG_CONFIG={work}"], cwd=source_dir, check=True)
+    return True
+
+
+def review_config(board, firmware, source_dir, open_menuconfig=False):
     """Bring the saved build config up to date, let the user review it, return the work file."""
     saved, work = board.saved(firmware), board.work(firmware)
     if not os.path.isfile(saved):
@@ -380,23 +389,23 @@ def review_config(board, firmware, source_dir, menuconfig=True):
     step(f"{firmware.capitalize()} build config for {board.name}")
     if DRY_RUN:
         run(["make", "olddefconfig", f"KCONFIG_CONFIG={work}"], cwd=source_dir)
-        if menuconfig:
+        if open_menuconfig:
             run(["make", "menuconfig", f"KCONFIG_CONFIG={work}"], cwd=source_dir)
         return work
     os.makedirs(WORK_DIR, exist_ok=True)
     shutil.copyfile(saved, work)
     subprocess.run(["make", "olddefconfig", f"KCONFIG_CONFIG={work}"], cwd=source_dir,
                    check=True, stdout=subprocess.DEVNULL)
-    shown = None
     updated = _read(work)
-    if menuconfig:
-        if not sys.stdin.isatty():
-            raise Fatal("menuconfig needs a terminal; pass --no-menuconfig to skip the review")
-        subprocess.run(["make", "menuconfig", f"KCONFIG_CONFIG={work}"], cwd=source_dir, check=True)
-    while _read(saved) != _read(work):
+    saved_name = f"boards/{board.key}/{firmware}.config"
+    if open_menuconfig:
+        run_menuconfig(source_dir, work)
+    shown = None
+    while True:
+        differs = _read(saved) != _read(work)
         if ASSUME_YES:
             choice = "y"
-        else:
+        elif differs:
             if _read(work) != shown:
                 if _read(work) == updated:
                     info(f"\nThe installed {firmware.capitalize()} version changes the saved "
@@ -406,22 +415,34 @@ def review_config(board, firmware, source_dir, menuconfig=True):
                 else:
                     info(f"\nBuild config for {board.name} differs from the saved one "
                          f"({firmware.capitalize()} version changes plus your menuconfig edits):")
-                show_diff(saved, work, f"boards/{board.key}/{firmware}.config", "new")
+                show_diff(saved, work, saved_name, "new")
                 shown = _read(work)
             info(f"\nKeep these changes to the {board.name} build config?")
             choice = ask("  [Y] keep the new config and save it (default)\n"
                          "  [N] discard the changes, build with the saved config\n"
+                         "  [M] open menuconfig\n"
                          "  [E] edit by hand (vimdiff)\n"
                          "  [D] show the diff again\n"
                          "  [Q] quit without building\n"
-                         "Choice [Y/n/e/d/q]: ", "ynedq", default="y")
+                         "Choice [Y/n/m/e/d/q]: ", "ynmedq", default="y")
+        else:
+            info(f"\nBuild config for {board.name} is unchanged.")
+            choice = ask("  [Y] build with it (default)\n"
+                         "  [M] open menuconfig\n"
+                         "  [Q] quit without building\n"
+                         "Choice [Y/m/q]: ", "ymq", default="y")
         if choice == "y":
-            shutil.copyfile(work, saved)
-            info(f"Saved to boards/{board.key}/{firmware}.config (commit it in {REPO}).")
-        elif choice == "n":
+            if differs:
+                shutil.copyfile(work, saved)
+                info(f"Saved to {saved_name} (commit it in {REPO}).")
+            return work
+        if choice == "n":
             shutil.copyfile(saved, work)
             info("Changes discarded; building with the saved config.")
-            break
+            return work
+        if choice == "m":
+            run_menuconfig(source_dir, work)
+            shown = None
         elif choice == "e":
             subprocess.call(["vimdiff", work, saved])
             shown = None
@@ -429,9 +450,6 @@ def review_config(board, firmware, source_dir, menuconfig=True):
             shown = None
         elif choice == "q":
             raise Fatal("quit before building")
-    if _read(saved) == _read(work) and updated == _read(saved):
-        info("Build config unchanged.")
-    return work
 
 
 def build(source_dir, kconfig):
@@ -637,7 +655,7 @@ def cmd_boards(args, mcus, boards):
 def cmd_config(args, mcus, boards):
     for mcu in select_targets(args.targets, mcus, boards, args.board):
         source = KATAPULT_DIR if args.katapult else KLIPPER_DIR
-        review_config(mcu.board, "katapult" if args.katapult else "klipper", source, menuconfig=True)
+        review_config(mcu.board, "katapult" if args.katapult else "klipper", source, open_menuconfig=True)
 
 
 def cmd_klipper(args, mcus, boards):
@@ -647,7 +665,7 @@ def cmd_klipper(args, mcus, boards):
     reviewed = {}
     for mcu in targets:
         if mcu.board.key not in reviewed:
-            reviewed[mcu.board.key] = review_config(mcu.board, "klipper", KLIPPER_DIR, not args.no_menuconfig)
+            reviewed[mcu.board.key] = review_config(mcu.board, "klipper", KLIPPER_DIR)
     with KlipperService() as service:
         for mcu in targets:
             kconfig = reviewed[mcu.board.key]
@@ -672,8 +690,8 @@ def cmd_katapult(args, mcus, boards):
         run(["git", "pull"], cwd=KATAPULT_DIR)
     else:
         run(["git", "clone", KATAPULT_REPO, KATAPULT_DIR])
-    katapult_cfg = review_config(board, "katapult", KATAPULT_DIR, not args.no_menuconfig)
-    klipper_cfg = review_config(board, "klipper", KLIPPER_DIR, not args.no_menuconfig)
+    katapult_cfg = review_config(board, "katapult", KATAPULT_DIR)
+    klipper_cfg = review_config(board, "klipper", KLIPPER_DIR)
     with KlipperService() as service:
         step(f"Building Katapult for {board.name}")
         build(KATAPULT_DIR, katapult_cfg)
@@ -716,8 +734,7 @@ def main():
     target.add_argument("targets", nargs="+", metavar="mcu", help="MCU name from the printer config, a board profile, or 'all'")
     target.add_argument("--board", metavar="PROFILE", help="use (and remember) this board profile for the MCU")
     flash = argparse.ArgumentParser(add_help=False)
-    flash.add_argument("--no-menuconfig", action="store_true", help="skip the menuconfig review")
-    flash.add_argument("--yes", action="store_true", help="keep and save build config changes without asking")
+    flash.add_argument("--yes", action="store_true", help="skip the build config menu; keep and save any changes")
 
     parser = argparse.ArgumentParser(prog="mcuflash", description=__doc__.split("\n\n")[0])
     sub = parser.add_subparsers(dest="command", required=True, metavar="command")

@@ -10,7 +10,7 @@ _mcuflash() {
         klipper|katapult|config)
             if [[ $cur == -* ]]; then
                 local flags="--board --config-dir --dry-run"
-                [[ ${COMP_WORDS[1]} != config ]] && flags+=" --no-menuconfig --yes"
+                [[ ${COMP_WORDS[1]} != config ]] && flags+=" --yes"
                 [[ ${COMP_WORDS[1]} == katapult ]] && flags+=" --deployer"
                 [[ ${COMP_WORDS[1]} == config ]] && flags+=" --katapult"
                 COMPREPLY=($(compgen -W "$flags" -- "$cur"))
