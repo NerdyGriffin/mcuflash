@@ -1,0 +1,758 @@
+#!/usr/bin/env python3
+"""mcuflash - build and flash Klipper / Katapult for the MCUs in a printer config.
+
+MCU names come from the [mcu] / [mcu <name>] sections of the Klipper config, the
+device path from their `serial:` lines, and the build configs from boards/<model>/.
+"""
+import argparse
+import configparser
+import difflib
+import glob
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+
+REPO = os.path.dirname(os.path.realpath(__file__))
+BOARDS_DIR = os.path.join(REPO, "boards")
+WORK_DIR = os.path.join(REPO, ".work")
+LOCAL_FILE = os.path.join(REPO, ".mcuflash-local")
+
+HOME = os.path.expanduser("~")
+CONFIG_DIR = os.environ.get("MCUFLASH_CONFIG_DIR", os.path.join(HOME, "printer_data", "config"))
+KLIPPER_DIR = os.environ.get("MCUFLASH_KLIPPER_DIR", os.path.join(HOME, "klipper"))
+KATAPULT_DIR = os.environ.get("MCUFLASH_KATAPULT_DIR", os.path.join(HOME, "katapult"))
+KATAPULT_ENV = os.environ.get("MCUFLASH_KATAPULT_ENV", os.path.join(HOME, "katapult-env"))
+KLIPPER_SERVICE = os.environ.get("MCUFLASH_KLIPPER_SERVICE", "klipper")
+MOONRAKER_URL = os.environ.get("MCUFLASH_MOONRAKER_URL", "http://localhost:7125")
+KATAPULT_REPO = "https://github.com/Arksine/katapult"
+BY_ID = "/dev/serial/by-id"
+HOST_MCU_SERIAL = "/tmp/klipper_host_mcu"
+
+KLIPPER_METHODS = ("katapult", "make-flash", "host")
+KATAPULT_METHODS = ("dfu", "rp2-bootsel")
+
+DRY_RUN = False
+ASSUME_YES = False
+
+
+class Fatal(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- output
+
+def _c(code, text):
+    return f"\033[{code}m{text}\033[0m" if sys.stdout.isatty() else text
+
+
+def info(msg=""):
+    print(msg, flush=True)
+
+
+def step(msg):
+    info(_c("1;36", f"==> {msg}"))
+
+
+def warn(msg):
+    info(_c("1;33", f"warning: {msg}"))
+
+
+def run(cmd, cwd=None, check=True):
+    """Run a command with its output going straight to the terminal."""
+    shown = " ".join(_quote(c) for c in cmd)
+    info(_c("2", f"  $ {shown}" + (f"   (in {cwd})" if cwd else "")))
+    if DRY_RUN:
+        return 0
+    rc = subprocess.call(cmd, cwd=cwd)
+    if check and rc != 0:
+        raise Fatal(f"command failed with exit code {rc}: {shown}")
+    return rc
+
+
+def _quote(arg):
+    return arg if re.fullmatch(r"[\w@%+=:,./-]+", arg) else "'" + arg.replace("'", "'\\''") + "'"
+
+
+def ask(prompt, choices, default=None):
+    """Prompt for one letter out of `choices`; ENTER picks `default`."""
+    while True:
+        try:
+            answer = input(prompt).strip().lower()
+        except EOFError:
+            raise Fatal("no terminal to answer the prompt; use --yes or --no-menuconfig")
+        if not answer and default:
+            return default
+        if answer[:1] in choices:
+            return answer[:1]
+
+
+# ---------------------------------------------------------------- boards
+
+def norm(name):
+    return name.lower().replace("_", "-")
+
+
+class Board:
+    def __init__(self, key):
+        self.key = key
+        self.dir = os.path.join(BOARDS_DIR, key)
+        parser = configparser.ConfigParser(interpolation=None)
+        parser.read(os.path.join(self.dir, "board.conf"))
+        conf = parser["board"] if parser.has_section("board") else {}
+        self.name = conf.get("name", key)
+        self.klipper_flash = conf.get("klipper_flash", "")
+        self.katapult_install = conf.get("katapult_install", "")
+        self.dfu_id = conf.get("dfu_id", "0483:df11")
+        self.boot_mode = conf.get("boot_mode", "").strip()
+        self.leave_boot_mode = conf.get("leave_boot_mode", "").strip()
+        self.katapult_entry = conf.get("katapult_entry", "").strip()
+        self.untested = conf.get("untested", "no").strip().lower() in ("yes", "true", "1")
+        self.chip = conf.get("chip") or self._chip_from_kconfig()
+
+    def saved(self, firmware):
+        return os.path.join(self.dir, f"{firmware}.config")
+
+    def work(self, firmware):
+        return os.path.join(WORK_DIR, f"{self.key}.{firmware}.config")
+
+    def _chip_from_kconfig(self):
+        try:
+            text = open(self.saved("klipper")).read()
+        except OSError:
+            return ""
+        match = re.search(r'^CONFIG_MCU="([^"]+)"', text, re.M)
+        if match:
+            return match.group(1)
+        return "linux" if re.search(r"^CONFIG_MACH_LINUX=y", text, re.M) else ""
+
+
+def load_boards():
+    boards = {}
+    for path in sorted(glob.glob(os.path.join(BOARDS_DIR, "*", "board.conf"))):
+        key = os.path.basename(os.path.dirname(path))
+        boards[key] = Board(key)
+    return boards
+
+
+def find_board(boards, name):
+    for key, board in boards.items():
+        if norm(key) == norm(name):
+            return board
+    return None
+
+
+# ---------------------------------------------------------------- printer config
+
+class Mcu:
+    def __init__(self, name, serial="", canbus=""):
+        self.name = name
+        self.serial = serial
+        self.canbus = canbus
+        self.board = None
+
+    @property
+    def section(self):
+        return "mcu" if self.name == "mcu" else f"mcu {self.name}"
+
+    @property
+    def is_host(self):
+        return self.serial.startswith("/tmp/")
+
+    @property
+    def serial_id(self):
+        """`rp2040_3033393834058AB0` out of `usb-Klipper_rp2040_3033393834058AB0-if00`."""
+        match = re.match(r"usb-[^_]+_(.+?)(-if\d+)?$", os.path.basename(self.serial))
+        return match.group(1) if match else ""
+
+    @property
+    def chip(self):
+        if self.is_host:
+            return "linux"
+        sid = self.serial_id
+        return sid.rsplit("_", 1)[0] if "_" in sid else ""
+
+    def _path(self, product):
+        base = os.path.basename(self.serial)
+        return os.path.join(BY_ID, re.sub(r"^usb-[^_]+_", f"usb-{product}_", base))
+
+    @property
+    def klipper_path(self):
+        return self._path("Klipper")
+
+    @property
+    def katapult_path(self):
+        return self._path("katapult")
+
+    @property
+    def state(self):
+        if self.is_host:
+            return "host"
+        if not self.serial_id:
+            return "unsupported"
+        if os.path.exists(self.katapult_path):
+            return "katapult"
+        if os.path.exists(self.klipper_path):
+            return "klipper"
+        return "missing"
+
+
+def _config_lines(path, seen):
+    """Yield the lines of a Klipper config file, following [include] directives."""
+    real = os.path.realpath(path)
+    if real in seen or not os.path.isfile(real):
+        return
+    seen.add(real)
+    with open(real, errors="replace") as handle:
+        for line in handle:
+            if line.startswith("#*# <"):
+                break
+            match = re.match(r"\[include\s+([^\]]+)\]", line.strip())
+            if match:
+                pattern = os.path.join(os.path.dirname(path), match.group(1).strip())
+                for included in sorted(glob.glob(pattern)):
+                    yield from _config_lines(included, seen)
+                continue
+            yield line
+
+
+def discover_mcus(config_dir=None):
+    printer_cfg = os.path.join(config_dir or CONFIG_DIR, "printer.cfg")
+    if not os.path.isfile(printer_cfg):
+        raise Fatal(f"no printer.cfg in {config_dir or CONFIG_DIR} (set --config-dir)")
+    mcus, current = {}, None
+    for line in _config_lines(printer_cfg, set()):
+        stripped = line.strip()
+        header = re.match(r"\[([^\]]+)\]", stripped)
+        if header:
+            words = header.group(1).split()
+            current = None
+            if words and words[0] == "mcu" and len(words) <= 2:
+                name = words[1] if len(words) == 2 else "mcu"
+                current = mcus.setdefault(name, Mcu(name))
+            continue
+        if current is None or stripped.startswith(("#", ";")):
+            continue
+        option = re.match(r"(serial|canbus_uuid)\s*[:=]\s*(\S+)", stripped)
+        if option:
+            if option.group(1) == "serial":
+                current.serial = option.group(2)
+            else:
+                current.canbus = option.group(2)
+    return mcus
+
+
+# ---------------------------------------------------------------- mcu -> board
+
+def load_local():
+    try:
+        with open(LOCAL_FILE) as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_local(data):
+    with open(LOCAL_FILE, "w") as handle:
+        json.dump(data, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+
+
+def local_key(mcu):
+    return mcu.serial_id or mcu.serial
+
+
+def resolve_board(mcu, boards, interactive=False, forced=None):
+    """Attach the board profile to `mcu`; ask once and remember when the chip is ambiguous."""
+    local = load_local()
+    if forced:
+        board = find_board(boards, forced)
+        if board is None:
+            raise Fatal(f"no board profile named '{forced}' (see `mcuflash boards`)")
+        if board.chip != mcu.chip:
+            raise Fatal(f"board '{board.key}' is a {board.chip}, but [{mcu.section}] is a {mcu.chip or 'unknown chip'}")
+        local[local_key(mcu)] = board.key
+        if not DRY_RUN:
+            save_local(local)
+        mcu.board = board
+        return board
+    remembered = local.get(local_key(mcu))
+    if remembered in boards:
+        mcu.board = boards[remembered]
+        return mcu.board
+    candidates = [b for b in boards.values() if b.chip and b.chip == mcu.chip]
+    if len(candidates) == 1:
+        mcu.board = candidates[0]
+    elif len(candidates) > 1 and interactive:
+        info(f"\n[{mcu.section}] is a {mcu.chip} ({local_key(mcu)}). Which board is it?")
+        for index, board in enumerate(candidates, 1):
+            info(f"  {index}) {board.key:<18} {board.name}")
+        while mcu.board is None:
+            try:
+                answer = input(f"Board for [{mcu.section}] [1-{len(candidates)}]: ").strip()
+            except EOFError:
+                raise Fatal("no terminal to answer the prompt; pass --board <profile>")
+            if answer.isdigit() and 1 <= int(answer) <= len(candidates):
+                mcu.board = candidates[int(answer) - 1]
+            elif find_board({b.key: b for b in candidates}, answer):
+                mcu.board = find_board({b.key: b for b in candidates}, answer)
+        local[local_key(mcu)] = mcu.board.key
+        if not DRY_RUN:
+            save_local(local)
+        note = " (dry run: not saved)" if DRY_RUN else f" in {os.path.basename(LOCAL_FILE)}"
+        info(f"Remembered [{mcu.section}] = {mcu.board.key}{note}")
+    return mcu.board
+
+
+def select_targets(names, mcus, boards, forced_board=None):
+    """Turn MCU names, board aliases and `all` into a list of MCUs with boards attached."""
+    for mcu in mcus.values():
+        resolve_board(mcu, boards)
+    picked = []
+    for name in names:
+        if name == "all":
+            matches = [m for m in mcus.values() if m.serial]
+            for skipped in (m for m in mcus.values() if not m.serial):
+                warn(f"skipping [{skipped.section}]: no `serial:` (CAN bus is not supported)")
+        elif name in mcus:
+            matches = [mcus[name]]
+        else:
+            board = find_board(boards, name)
+            if board is None:
+                raise Fatal(f"'{name}' is neither an MCU ({', '.join(mcus)}) nor a board profile")
+            matches = [m for m in mcus.values() if m.board is board]
+            if not matches:
+                unresolved = [m.name for m in mcus.values() if m.board is None and m.chip == board.chip]
+                hint = f"; assign it first with: mcuflash klipper {unresolved[0]} --board {board.key}" if unresolved else ""
+                raise Fatal(f"no MCU in this printer config is mapped to board '{board.key}'{hint}")
+            if len(matches) > 1:
+                raise Fatal(f"board '{board.key}' matches several MCUs; name one of: "
+                            + ", ".join(m.name for m in matches))
+        for mcu in matches:
+            if mcu not in picked:
+                picked.append(mcu)
+    if forced_board and len(picked) != 1:
+        raise Fatal("--board applies to a single MCU")
+    for mcu in picked:
+        if not mcu.serial:
+            raise Fatal(f"[{mcu.section}] has no `serial:` (CAN bus is not supported)")
+        resolve_board(mcu, boards, interactive=True, forced=forced_board)
+        if mcu.board is None:
+            raise Fatal(f"no board profile for chip '{mcu.chip}' of [{mcu.section}]; add one under boards/")
+        if mcu.board.chip != mcu.chip:
+            raise Fatal(f"[{mcu.section}] is a {mcu.chip}, but board '{mcu.board.key}' builds for {mcu.board.chip}")
+    return picked
+
+
+# ---------------------------------------------------------------- build config review
+
+def _read(path):
+    try:
+        with open(path) as handle:
+            return handle.read()
+    except OSError:
+        return ""
+
+
+def show_diff(old_path, new_path, old_label, new_label):
+    """Print a compact unified diff; return True when the files differ."""
+    lines = list(difflib.unified_diff(_read(old_path).splitlines(), _read(new_path).splitlines(),
+                                      old_label, new_label, n=0, lineterm=""))
+    for line in lines:
+        if line.startswith("@@"):
+            continue
+        color = "32" if line.startswith("+") and not line.startswith("+++") else \
+                "31" if line.startswith("-") and not line.startswith("---") else "2"
+        info("  " + _c(color, line))
+    return bool(lines)
+
+
+def review_config(board, firmware, source_dir, menuconfig=True):
+    """Bring the saved build config up to date, let the user review it, return the work file."""
+    saved, work = board.saved(firmware), board.work(firmware)
+    if not os.path.isfile(saved):
+        raise Fatal(f"board '{board.key}' has no {firmware}.config")
+    step(f"{firmware.capitalize()} build config for {board.name}")
+    if DRY_RUN:
+        run(["make", "olddefconfig", f"KCONFIG_CONFIG={work}"], cwd=source_dir)
+        if menuconfig:
+            run(["make", "menuconfig", f"KCONFIG_CONFIG={work}"], cwd=source_dir)
+        return work
+    os.makedirs(WORK_DIR, exist_ok=True)
+    shutil.copyfile(saved, work)
+    subprocess.run(["make", "olddefconfig", f"KCONFIG_CONFIG={work}"], cwd=source_dir,
+                   check=True, stdout=subprocess.DEVNULL)
+    shown = None
+    if _read(saved) != _read(work):
+        info(f"Changed by the installed {firmware.capitalize()} version (new or removed options):")
+        show_diff(saved, work, "saved", "updated")
+        shown = _read(work)
+    else:
+        info("Saved config is current for this version.")
+    if menuconfig:
+        if not sys.stdin.isatty():
+            raise Fatal("menuconfig needs a terminal; pass --no-menuconfig to skip the review")
+        subprocess.run(["make", "menuconfig", f"KCONFIG_CONFIG={work}"], cwd=source_dir, check=True)
+    while _read(saved) != _read(work):
+        if ASSUME_YES:
+            choice = "y"
+        else:
+            if _read(work) != shown:
+                info(f"\nBuild config for {board.name} differs from the saved one:")
+                show_diff(saved, work, f"boards/{board.key}/{firmware}.config", "new")
+                shown = _read(work)
+            info(f"\nKeep these changes to the {board.name} build config?")
+            choice = ask("  [Y] keep the new config and save it (default)\n"
+                         "  [N] discard the changes, build with the saved config\n"
+                         "  [E] edit by hand (vimdiff)\n"
+                         "  [D] show the diff again\n"
+                         "  [Q] quit without building\n"
+                         "Choice [Y/n/e/d/q]: ", "ynedq", default="y")
+        if choice == "y":
+            shutil.copyfile(work, saved)
+            info(f"Saved to boards/{board.key}/{firmware}.config (commit it in {REPO}).")
+        elif choice == "n":
+            shutil.copyfile(saved, work)
+            info("Changes discarded; building with the saved config.")
+            break
+        elif choice == "e":
+            subprocess.call(["vimdiff", work, saved])
+            shown = None
+        elif choice == "d":
+            shown = None
+        elif choice == "q":
+            raise Fatal("quit before building")
+    return work
+
+
+def build(source_dir, kconfig):
+    jobs = f"-j{os.cpu_count() or 1}"
+    run(["make", "clean", f"KCONFIG_CONFIG={kconfig}"], cwd=source_dir)
+    run(["make", jobs, f"KCONFIG_CONFIG={kconfig}"], cwd=source_dir)
+
+
+# ---------------------------------------------------------------- klipper service
+
+class KlipperService:
+    """Stops the Klipper service on first use and always starts it again on exit."""
+
+    def __init__(self):
+        self.stopped = False
+
+    def stop(self):
+        if not self.stopped:
+            step(f"Stopping the {KLIPPER_SERVICE} service")
+            run(["sudo", "service", KLIPPER_SERVICE, "stop"])
+            self.stopped = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        if self.stopped:
+            step(f"Starting the {KLIPPER_SERVICE} service")
+            run(["sudo", "service", KLIPPER_SERVICE, "start"], check=False)
+        return False
+
+
+def wait_for(path, seconds=15):
+    if DRY_RUN:
+        return True
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        if os.path.exists(path):
+            return True
+        time.sleep(0.5)
+    return False
+
+
+# ---------------------------------------------------------------- flashing
+
+def ensure_katapult_env():
+    if os.path.exists(KATAPULT_ENV):
+        return
+    step("Creating a Python environment for Katapult's flashtool")
+    run(["virtualenv", "-p", "python3", KATAPULT_ENV])
+    run([os.path.join(KATAPULT_ENV, "bin", "pip3"), "install", "pyserial"])
+
+
+def flashtool(device, firmware):
+    ensure_katapult_env()
+    run([os.path.join(KATAPULT_ENV, "bin", "python3"),
+         os.path.join(KATAPULT_DIR, "scripts", "flashtool.py"), "-f", firmware, "-d", device])
+
+
+def bootloader_device(mcu):
+    """Return the device path to hand to flashtool, waiting for the board if needed."""
+    while True:
+        if os.path.exists(mcu.katapult_path):
+            return mcu.katapult_path
+        if os.path.exists(mcu.klipper_path) or DRY_RUN:
+            return mcu.klipper_path
+        info(f"\n[{mcu.section}] is not connected as Klipper or Katapult ({mcu.serial_id}).")
+        if mcu.board.katapult_entry:
+            info(mcu.board.katapult_entry)
+        subprocess.call(["ls", "-l", BY_ID])
+        if ask("Press ENTER to look again, or q to quit: ", "q", default="r") == "q":
+            raise Fatal(f"[{mcu.section}] not found")
+
+
+def flash_klipper(mcu, kconfig, service):
+    board = mcu.board
+    method = board.klipper_flash
+    step(f"Flashing Klipper to [{mcu.section}] ({board.name}) with method '{method}'")
+    if method == "katapult":
+        service.stop()
+        flashtool(bootloader_device(mcu), os.path.join(KLIPPER_DIR, "out", "klipper.bin"))
+    elif method == "make-flash":
+        service.stop()
+        run(["make", "flash", f"KCONFIG_CONFIG={kconfig}", f"FLASH_DEVICE={mcu.klipper_path}"], cwd=KLIPPER_DIR)
+    elif method == "host":
+        if not os.path.exists("/etc/systemd/system/klipper-mcu.service"):
+            run(["sudo", "cp", "-v", "./scripts/klipper-mcu.service", "/etc/systemd/system/"], cwd=KLIPPER_DIR)
+            run(["sudo", "systemctl", "enable", "klipper-mcu.service"])
+        service.stop()
+        run(["make", "flash", f"KCONFIG_CONFIG={kconfig}"], cwd=KLIPPER_DIR)
+        return
+    else:
+        raise Fatal(f"board '{board.key}' has no klipper_flash method (one of: {', '.join(KLIPPER_METHODS)})")
+    if not wait_for(mcu.klipper_path):
+        warn(f"{mcu.klipper_path} did not come back within 15 s")
+
+
+def check_method(board, firmware):
+    method = board.klipper_flash if firmware == "klipper" else board.katapult_install
+    valid = KLIPPER_METHODS if firmware == "klipper" else KATAPULT_METHODS
+    if method not in valid:
+        raise Fatal(f"board '{board.key}' has no valid {firmware} method in board.conf (one of: {', '.join(valid)})")
+    if board.untested:
+        warn(f"the '{board.key}' profile is marked untested; check the commands before trusting it")
+
+
+def install_katapult_dfu(board, kconfig):
+    while True:
+        info("\n" + (board.boot_mode or "Put the board into DFU mode."))
+        if not DRY_RUN:
+            input("Press ENTER when ready: ")
+        listing = "" if DRY_RUN else subprocess.run(["dfu-util", "-l"], capture_output=True, text=True).stdout
+        if DRY_RUN or board.dfu_id in listing:
+            break
+        info(listing.strip() or "dfu-util found no devices.")
+        warn(f"no DFU device {board.dfu_id} found")
+        if ask("Press ENTER to try again, or q to quit: ", "q", default="r") == "q":
+            raise Fatal("DFU device not found")
+    run(["make", "flash", f"KCONFIG_CONFIG={kconfig}", f"FLASH_DEVICE={board.dfu_id}"], cwd=KATAPULT_DIR)
+
+
+def find_rp2_drive():
+    for pattern in ("/dev/disk/by-label/RPI-RP2", "/dev/disk/by-id/usb-RPI_RP2*-part1"):
+        found = sorted(glob.glob(pattern))
+        if found:
+            return found[0]
+    return None
+
+
+def install_katapult_bootsel(board):
+    mount_point = "/mnt/pico"
+    while True:
+        info("\n" + (board.boot_mode or "Put the board into BOOTSEL mode."))
+        if not DRY_RUN:
+            input("Press ENTER when ready: ")
+        drive = "/dev/disk/by-label/RPI-RP2" if DRY_RUN else find_rp2_drive()
+        if drive:
+            break
+        warn("no RPI-RP2 drive found")
+        if ask("Press ENTER to try again, or q to quit: ", "q", default="r") == "q":
+            raise Fatal("RPI-RP2 drive not found")
+    run(["sudo", "mkdir", "-vp", mount_point])
+    run(["sudo", "mount", "-v", drive, mount_point])
+    try:
+        run(["sudo", "cp", "-v", os.path.join(KATAPULT_DIR, "out", "katapult.uf2"), mount_point])
+        run(["sudo", "sync"])
+    finally:
+        run(["sudo", "umount", "-v", mount_point], check=False)
+
+
+def install_katapult_deployer(mcu, kconfig):
+    if not DRY_RUN and not re.search(r"^CONFIG_BUILD_DEPLOYER=y", _read(kconfig), re.M):
+        raise Fatal("the Katapult config does not build the deployer (CONFIG_BUILD_DEPLOYER)")
+    warn("the deployer overwrites the existing bootloader. A wrong Katapult build config "
+         "leaves the board unable to boot until it is recovered over DFU/BOOTSEL or a programmer.")
+    if not DRY_RUN:
+        try:
+            if input("Type 'yes' to overwrite the bootloader: ").strip().lower() != "yes":
+                raise Fatal("deployer flash cancelled")
+        except EOFError:
+            raise Fatal("deployer flash needs a terminal to confirm")
+    flashtool(bootloader_device(mcu), os.path.join(KATAPULT_DIR, "out", "deployer.bin"))
+
+
+# ---------------------------------------------------------------- commands
+
+def moonraker_versions(mcus):
+    query = "&".join(urllib.parse.quote(m.section) for m in mcus)
+    try:
+        with urllib.request.urlopen(f"{MOONRAKER_URL}/printer/objects/query?{query}", timeout=2) as reply:
+            status = json.load(reply)["result"]["status"]
+    except Exception:
+        return {}
+    return {m.name: status.get(m.section, {}).get("mcu_version", "") for m in mcus}
+
+
+def cmd_list(args, mcus, boards):
+    for mcu in mcus.values():
+        resolve_board(mcu, boards)
+    versions = {} if args.config_dir else moonraker_versions(list(mcus.values()))
+    rows = [("MCU", "BOARD", "SERIAL ID", "STATE", "FIRMWARE")]
+    for mcu in mcus.values():
+        board = mcu.board.key if mcu.board else ("?" if mcu.serial else "-")
+        rows.append((mcu.name, board, mcu.serial_id or mcu.serial or f"canbus {mcu.canbus}",
+                     mcu.state, versions.get(mcu.name) or "-"))
+    widths = [max(len(row[i]) for row in rows) for i in range(len(rows[0]))]
+    for row in rows:
+        info("  ".join(cell.ljust(width) for cell, width in zip(row, widths)).rstrip())
+    if any(mcu.board is None and mcu.serial for mcu in mcus.values()):
+        info("\n'?' = the chip matches several board profiles; you are asked once on first flash.")
+
+
+def cmd_boards(args, mcus, boards):
+    rows = [("BOARD", "CHIP", "KLIPPER", "KATAPULT", "NAME")]
+    for board in boards.values():
+        rows.append((board.key, board.chip or "?", board.klipper_flash or "-",
+                     board.katapult_install or "-", board.name + (" (untested)" if board.untested else "")))
+    widths = [max(len(row[i]) for row in rows) for i in range(len(rows[0]))]
+    for row in rows:
+        info("  ".join(cell.ljust(width) for cell, width in zip(row, widths)).rstrip())
+
+
+def cmd_config(args, mcus, boards):
+    for mcu in select_targets(args.targets, mcus, boards, args.board):
+        source = KATAPULT_DIR if args.katapult else KLIPPER_DIR
+        review_config(mcu.board, "katapult" if args.katapult else "klipper", source, menuconfig=True)
+
+
+def cmd_klipper(args, mcus, boards):
+    targets = select_targets(args.targets, mcus, boards, args.board)
+    for mcu in targets:
+        check_method(mcu.board, "klipper")
+    reviewed = {}
+    for mcu in targets:
+        if mcu.board.key not in reviewed:
+            reviewed[mcu.board.key] = review_config(mcu.board, "klipper", KLIPPER_DIR, not args.no_menuconfig)
+    with KlipperService() as service:
+        for mcu in targets:
+            kconfig = reviewed[mcu.board.key]
+            step(f"Building Klipper for {mcu.board.name}")
+            build(KLIPPER_DIR, kconfig)
+            flash_klipper(mcu, kconfig, service)
+    step("Done")
+    if not DRY_RUN:
+        subprocess.call(["ls", "-l", BY_ID])
+
+
+def cmd_katapult(args, mcus, boards):
+    targets = select_targets(args.targets, mcus, boards, args.board)
+    if len(targets) != 1:
+        raise Fatal("install Katapult on one MCU at a time")
+    mcu, board = targets[0], targets[0].board
+    if not args.deployer:
+        check_method(board, "katapult")
+    check_method(board, "klipper")
+    step("Updating the Katapult source")
+    if os.path.isdir(KATAPULT_DIR):
+        run(["git", "pull"], cwd=KATAPULT_DIR)
+    else:
+        run(["git", "clone", KATAPULT_REPO, KATAPULT_DIR])
+    katapult_cfg = review_config(board, "katapult", KATAPULT_DIR, not args.no_menuconfig)
+    klipper_cfg = review_config(board, "klipper", KLIPPER_DIR, not args.no_menuconfig)
+    with KlipperService() as service:
+        step(f"Building Katapult for {board.name}")
+        build(KATAPULT_DIR, katapult_cfg)
+        service.stop()
+        if args.deployer:
+            step(f"Updating Katapult on [{mcu.section}] with the deployer")
+            install_katapult_deployer(mcu, katapult_cfg)
+        elif board.katapult_install == "dfu":
+            step(f"Installing Katapult on [{mcu.section}] over DFU")
+            install_katapult_dfu(board, katapult_cfg)
+        else:
+            step(f"Installing Katapult on [{mcu.section}] over BOOTSEL")
+            install_katapult_bootsel(board)
+        if board.leave_boot_mode and not args.deployer:
+            info("\n" + board.leave_boot_mode)
+            if not DRY_RUN:
+                input("Press ENTER when ready: ")
+        if not wait_for(mcu.katapult_path) and not os.path.exists(mcu.klipper_path):
+            warn(f"{mcu.katapult_path} did not appear")
+        step(f"Building Klipper for {board.name}")
+        build(KLIPPER_DIR, klipper_cfg)
+        flash_klipper(mcu, klipper_cfg, service)
+    step("Done")
+
+
+def cmd_complete(args, mcus, boards):
+    names = list(mcus)
+    for mcu in mcus.values():
+        if resolve_board(mcu, boards):
+            names.append(mcu.board.key)
+    print(" ".join(dict.fromkeys(names + ["all"])))
+
+
+def main():
+    global DRY_RUN, ASSUME_YES, CONFIG_DIR
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--config-dir", metavar="DIR", help=f"Klipper config directory (default {CONFIG_DIR})")
+    common.add_argument("--dry-run", action="store_true", help="print the commands without running them")
+    target = argparse.ArgumentParser(add_help=False)
+    target.add_argument("targets", nargs="+", metavar="mcu", help="MCU name from the printer config, a board profile, or 'all'")
+    target.add_argument("--board", metavar="PROFILE", help="use (and remember) this board profile for the MCU")
+    flash = argparse.ArgumentParser(add_help=False)
+    flash.add_argument("--no-menuconfig", action="store_true", help="skip the menuconfig review")
+    flash.add_argument("--yes", action="store_true", help="keep and save build config changes without asking")
+
+    parser = argparse.ArgumentParser(prog="mcuflash", description=__doc__.split("\n\n")[0])
+    sub = parser.add_subparsers(dest="command", required=True, metavar="command")
+    sub.add_parser("list", parents=[common], help="show the MCUs in the printer config").set_defaults(func=cmd_list)
+    sub.add_parser("boards", parents=[common], help="show the available board profiles").set_defaults(func=cmd_boards)
+    sub.add_parser("klipper", parents=[common, target, flash],
+                   help="build and flash Klipper").set_defaults(func=cmd_klipper)
+    katapult = sub.add_parser("katapult", parents=[common, target, flash],
+                              help="build and install Katapult, then flash Klipper")
+    katapult.add_argument("--deployer", action="store_true",
+                          help="update an existing Katapult in place with deployer.bin instead of DFU/BOOTSEL")
+    katapult.set_defaults(func=cmd_katapult)
+    config = sub.add_parser("config", parents=[common, target], help="review a saved build config in menuconfig")
+    config.add_argument("--katapult", action="store_true", help="review the Katapult config instead of Klipper's")
+    config.set_defaults(func=cmd_config)
+    sub.add_parser("complete-targets", parents=[common]).set_defaults(func=cmd_complete)
+
+    args = parser.parse_args()
+    DRY_RUN = getattr(args, "dry_run", False)
+    ASSUME_YES = getattr(args, "yes", False)
+    if args.config_dir:
+        CONFIG_DIR = args.config_dir
+    try:
+        boards = load_boards()
+        mcus = {} if args.command == "boards" else discover_mcus()
+        args.func(args, mcus, boards)
+    except Fatal as error:
+        if args.command == "complete-targets":
+            return 1
+        print(_c("1;31", f"mcuflash: {error}"), file=sys.stderr)
+        return 1
+    except subprocess.CalledProcessError as error:
+        print(_c("1;31", f"mcuflash: command failed: {error}"), file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("\nmcuflash: interrupted", file=sys.stderr)
+        return 130
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
