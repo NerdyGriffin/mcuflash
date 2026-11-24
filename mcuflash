@@ -388,12 +388,7 @@ def review_config(board, firmware, source_dir, menuconfig=True):
     subprocess.run(["make", "olddefconfig", f"KCONFIG_CONFIG={work}"], cwd=source_dir,
                    check=True, stdout=subprocess.DEVNULL)
     shown = None
-    if _read(saved) != _read(work):
-        info(f"Changed by the installed {firmware.capitalize()} version (new or removed options):")
-        show_diff(saved, work, "saved", "updated")
-        shown = _read(work)
-    else:
-        info("Saved config is current for this version.")
+    updated = _read(work)
     if menuconfig:
         if not sys.stdin.isatty():
             raise Fatal("menuconfig needs a terminal; pass --no-menuconfig to skip the review")
@@ -403,7 +398,14 @@ def review_config(board, firmware, source_dir, menuconfig=True):
             choice = "y"
         else:
             if _read(work) != shown:
-                info(f"\nBuild config for {board.name} differs from the saved one:")
+                if _read(work) == updated:
+                    info(f"\nThe installed {firmware.capitalize()} version changes the saved "
+                         f"{board.name} build config (new or removed options):")
+                elif updated == _read(saved):
+                    info(f"\nYour menuconfig changes to the {board.name} build config:")
+                else:
+                    info(f"\nBuild config for {board.name} differs from the saved one "
+                         f"({firmware.capitalize()} version changes plus your menuconfig edits):")
                 show_diff(saved, work, f"boards/{board.key}/{firmware}.config", "new")
                 shown = _read(work)
             info(f"\nKeep these changes to the {board.name} build config?")
@@ -427,6 +429,8 @@ def review_config(board, firmware, source_dir, menuconfig=True):
             shown = None
         elif choice == "q":
             raise Fatal("quit before building")
+    if _read(saved) == _read(work) and updated == _read(saved):
+        info("Build config unchanged.")
     return work
 
 
